@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""
+NurseAssistant v1.0 – Assistant virtuel pour infirmier/infirmières
+-------------------------------------------------------------------
+Cette application a pour objectif d'assister les infirmiers/infirmières dans la gestion de leurs activités cliniques.
+Elle permet notamment de :
+  - Gérer les sessions et la traçabilité des activités.
+  - Stocker de manière sécurisée les dossiers patients (ex. signes vitaux).
+  - Analyser les signes vitaux pour détecter d'éventuels seuils critiques (ex. tension élevée, fièvre, etc.).
+  - Programmer des rappels de médication.
+  - Offrir une interface de chat pour recueillir les demandes du personnel soignant.
+  
+L'architecture du système est modulaire et s'inspire d'exemples existants, en adaptant les fonctionnalités psychiatriques aux besoins infirmiers.
+
+Auteur : ChatGPT (inspiré par divers exemples)
+Date   : 2025-04-16
+"""
+
+# =============================================================================
+# IMPORTS & CONFIGURATION GLOBALE
+# =============================================================================
+import os
+import sys
+import time
+import uuid
+import re
+import json
+import base64
+import asyncio
+import logging
+import traceback
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Callable
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+import uvicorn
+
+# Pour le chiffrement
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
+from cryptography.fernet import Fernet
+
+# Pour la NLP et extraction d'informations
+from langdetect import detect
+from googletrans import Translator
+
+# =============================================================================
+# CONFIGURATION DU LOGGER
+# =============================================================================
+def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+    logger_obj = logging.getLogger(name)
+    logger_obj.setLevel(level)
+    if not logger_obj.handlers:
+        ch = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        logger_obj.addHandler(ch)
+    return logger_obj
+
+logger = setup_logger("NurseAssistant")
+
+# =============================================================================
+# MODULE DE CHIFFREMENT DES DONNÉES (DataEncryptionManager)
+# =============================================================================
+class DataEncryptionManager:
+    """
+    Gère le chiffrement et le déchiffrement des données sensibles.
+    """
+    def __init__(self, encryption_key: str = None):
+        key_source = encryption_key or os.getenv("ENCRYPTION_KEY", "default_secure_key")
+        self.encryption_key = self._derive_key(key_source)
+        logger.info("DataEncryptionManager initialisé avec chiffrement AES.")
+
+    def _derive_key(self, passphrase: str) -> bytes:
+        salt = b"data_encryption_salt"
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+            backend=default_backend()
+        )
+        return base64.urlsafe_b64encode(kdf.derive(passphrase.encode()))
+
+    def encrypt_data(self, data: str) -> str:
+        try:
+            cipher = Fernet(self.encryption_key)
+            encrypted = cipher.encrypt(data.encode())
+            logger.info("Données chiffrées.")
+            return encrypted.decode()
+        except Exception as e:
+            logger.error(f"Erreur de chiffrement : {e}")
+            raise
+
+    def decrypt_data(self, encrypted_data: str) -> str:
+        try:
+            cipher = Fernet(self.encryption_key)
+            decrypted = cipher.decrypt(encrypted_data.encode())
+            logger.info("Données déchiffrées.")
+            return decrypted.decode()
+        except Exception as e:
+            logger.error(f"Erreur de déchiffrement : {e}")
+            raise
+
+# =============================================================================
+# GESTION DES SESSIONS (SessionManager)
+# =============================================================================
+class SessionManager:
+    """
+    Crée, valide et expire les sessions utilisateurs.
+    """
+    def __init__(self, secret_key: str, session_timeout: int = 3600):
+        self.secret_key = secret_key
+        self.session_timeout = session_timeout
+        self.sessions = {}  # Stockage en mémoire
+        logger.info("SessionManager initialisé.")
+
+    def create_session(self, user_id: str) -> str:
+        session_id = str(uuid.uuid4())
+        expiration_time = time.time() + self.session_timeout
+        session_data = {"user_id": user_id, "session_id": session_id, "exp": expiration_time}
+        self.sessions[session_id] = session_data
+        logger.info(f"Session créée pour l'utilisateur '{user_id}' avec l'ID '{session_id}'.")
+        return session_id
+
+    def validate_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        session = self.sessions.get(session_id)
+        if session and session["exp"] >= time.time():
+            logger.info(f"Session '{session_id}' validée.")
+            return session
+        logger.warning(f"Session '{session_id}' invalide ou expirée.")
+        return None
+
+    def expire_session(self, session_id: str):
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            logger.info(f"Session '{session_id}' expirée.")
+
+# =============================================================================
+# SUIVI DES ACTIVITÉS UTILISATEURS (UserActivityTracker)
+# =============================================================================
+class UserActivityTracker:
+    """
+    Enregistre les activités des utilisateurs pour audit et suivi.
+    """
+    def __init__(self, storage_dir: str = "user_activities"):
+        self.storage_dir = storage_dir
+        os.makedirs(storage_dir, exist_ok=True)
+        logger.info("UserActivityTracker initialisé.")
+
+    def record_activity(self, user_id: str, action: str, details: Optional[Dict[str, Any]] = None):
+        activity = {
+            "user_id": user_id,
+            "action": action,
+            "details": details or {},
+            "timestamp": time.time()
+        }
+        file_path = os.path.join(self.storage_dir, f"{user_id}_activities.json")
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "r") as f:
+                    activities = json.load(f)
+            else:
+                activities = []
+            activities.append(activity)
+            with open(file_path, "w") as f:
+                json.dump(activities, f, indent=4)
+            logger.info(f"Activité '{action}' enregistrée pour {user_id}.")
+        except Exception as e:
+            logger.error(f"Erreur lors de l'enregistrement d'activité : {e}")
+
+# =============================================================================
+# GESTION DES DOSSIERS PATIENTS (PatientRecordManager)
+# =============================================================================
+class PatientRecordManager:
+    """
+    Gère les dossiers patients de façon simplifiée via un stockage JSON.
+    """
+    def __init__(self, records_dir: str = "patient_records"):
+        self.records_dir = records_dir
+        os.makedirs(records_dir, exist_ok=True)
+        logger.info("PatientRecordManager initialisé.")
+
+    def add_record(self, patient_id: str, record: Dict[str, Any]):
+        file_path = os.path.join(self.records_dir, f"{patient_id}.json")
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "r") as f:
+                    records = json.load(f)
+            else:
+                records = []
+            records.append(record)
+            with open(file_path, "w") as f:
+                json.dump(records, f, indent=4)
+            logger.info(f"Enregistrement ajouté pour le patient {patient_id}.")
+        except Exception as e:
+            logger.error(f"Erreur lors de l'ajout d'un dossier patient : {e}")
+
+    def get_records(self, patient_id: str) -> List[Dict[str, Any]]:
+        file_path = os.path.join(self.records_dir, f"{patient_id}.json")
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, "r") as f:
+                    records = json.load(f)
+                logger.info(f"Récupération des dossiers pour le patient {patient_id}.")
+                return records
+            else:
+                logger.info(f"Aucun dossier trouvé pour le patient {patient_id}.")
+                return []
+        except Exception as e:
+            logger.error(f"Erreur lors de la récupération des dossiers : {e}")
+            return []
+
+# =============================================================================
+# GESTION DES RAPPELS MÉDICAMENTAIRES (MedicationReminderManager)
+# =============================================================================
+class MedicationReminderManager:
+    """
+    Planifie et envoie des rappels de médication.
+    Pour simplifier, les rappels sont logués après un délai simulé.
+    """
+    def __init__(self):
+        self.reminders = []
+
+    async def schedule_reminder(self, patient_id: str, medication: str, delay_seconds: int):
+        logger.info(f"Rappel programmé pour le patient {patient_id} pour le médicament '{medication}' dans {delay_seconds} s.")
+        await asyncio.sleep(delay_seconds)
+        reminder_message = f"Rappel: Patient {patient_id} doit recevoir {medication} maintenant."
+        logger.info(reminder_message)
+        self.reminders.append(reminder_message)
+        return reminder_message
+
+# =============================================================================
+# ANALYSE DES SIGNES VITAUX (VitalSignsAnalyzer)
+# =============================================================================
+class VitalSignsAnalyzer:
+    """
+    Analyse les signes vitaux et détecte d'éventuels états critiques.
+    """
+    def analyze(self, vital_signs: Dict[str, float]) -> Dict[str, Any]:
+        # On attend des clés par exemple : "systolic", "diastolic", "temperature", "heart_rate"
+        recommendations = []
+        critical = False
+        # Analyse tension artérielle
+        systolic = vital_signs.get("systolic", 0)
+        diastolic = vital_signs.get("diastolic", 0)
+        if systolic > 180 or diastolic > 120:
+            recommendations.append("Tension artérielle critique, contacter le médecin immédiatement.")
+            critical = True
+        elif systolic > 140 or diastolic > 90:
+            recommendations.append("Tension élevée, surveiller et conseiller une réduction de stress.")
+
+        # Analyse température
+        temperature = vital_signs.get("temperature", 0)
+        if temperature > 39:
+            recommendations.append("Fièvre élevée détectée, surveiller et envisager une intervention.")
+            critical = True
+
+        # Analyse fréquence cardiaque
+        heart_rate = vital_signs.get("heart_rate", 0)
+        if heart_rate > 120 or heart_rate < 50:
+            recommendations.append("Fréquence cardiaque anormale, vérifier l'état du patient.")
+            critical = True
+
+        if not recommendations:
+            recommendations.append("Signes vitaux dans la norme.")
+
+        result = {
+            "critical": critical,
+            "recommendations": recommendations,
+            "vital_signs": vital_signs
+        }
+        logger.info(f"Analyse des signes vitaux : {result}")
+        return result
+
+# =============================================================================
+# NLP PROCESSOR – Extraction des informations depuis le message
+# =============================================================================
+class NLPProcessor:
+    """
+    Effectue le traitement du texte et extrait des informations utiles.
+    Ici, on convertit le texte en minuscules et essaie d'extraire :
+      - Un identifiant patient (ex: "patientid:1234")
+      - Les signes vitaux sous forme "BP:120/80", "Temp:37.5", "HR:80"
+    """
+    def __init__(self):
+        self.translator = Translator()
+
+    def process(self, text: str) -> str:
+        processed = text.lower()
+        logger.info("NLPProcessor : texte converti en minuscules.")
+        return processed
+
+    def extract_vital_signs(self, text: str) -> Dict[str, float]:
+        vital_signs = {}
+        # Recherche d'un pattern pour tension : BP: systolic/diastolic (ex: "bp: 120/80")
+        bp_match = re.search(r"bp:\s*(\d{2,3})/(\d{2,3})", text)
+        if bp_match:
+            vital_signs["systolic"] = float(bp_match.group(1))
+            vital_signs["diastolic"] = float(bp_match.group(2))
+        # Température : Temp:37.5 ou temperature:37.5
+        temp_match = re.search(r"(?:temp(?:erature)?):\s*([\d\.]+)", text)
+        if temp_match:
+            vital_signs["temperature"] = float(temp_match.group(1))
+        # Fréquence cardiaque : HR:80 ou hrate:80
+        hr_match = re.search(r"(?:hr|heart rate):\s*(\d{2,3})", text)
+        if hr_match:
+            vital_signs["heart_rate"] = float(hr_match.group(1))
+        logger.info(f"VitalSigns extraits : {vital_signs}")
+        return vital_signs
+
+    def extract_patient_id(self, text: str) -> Optional[str]:
+        # Recherche d'un identifiant patient: "patientid:1234" ou "patient:1234"
+        pid_match = re.search(r"patient(?:id)?:\s*(\w+)", text)
+        if pid_match:
+            pid = pid_match.group(1)
+            logger.info(f"Patient ID extrait : {pid}")
+            return pid
+        return None
+
+# =============================================================================
+# SYSTÈME NURSE ASSISTANT – Classe principale
+# =============================================================================
+class NurseAssistant:
+    """
+    Système complet d'assistance pour infirmier/infirmières.
+    Il analyse les messages, extrait et analyse les signes vitaux,
+    met à jour le dossier patient, programme des rappels médicamenteux
+    et retourne une réponse adaptée.
+    """
+    def __init__(self):
+        self.encryption_manager = DataEncryptionManager()
+        self.session_manager = SessionManager(secret_key="nurse_secret_key")
+        self.activity_tracker = UserActivityTracker()
+        self.patient_record_manager = PatientRecordManager()
+        self.medication_reminder_manager = MedicationReminderManager()
+        self.vital_signs_analyzer = VitalSignsAnalyzer()
+        self.nlp_processor = NLPProcessor()
+        logger.info("NurseAssistant initialisé.")
+
+    async def handle_message(self, nurse_id: str, message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        # Gestion de la session
+        if not session_id or not self.session_manager.validate_session(session_id):
+            session_id = self.session_manager.create_session(nurse_id)
+            logger.info(f"Nouvelle session créée pour {nurse_id} : {session_id}")
+
+        # Enregistrement de l'activité
+        self.activity_tracker.record_activity(nurse_id, "message_reçu", {"message": message})
+
+        # Traitement du texte
+        processed_text = self.nlp_processor.process(message)
+        vital_signs = self.nlp_processor.extract_vital_signs(processed_text)
+        patient_id = self.nlp_processor.extract_patient_id(processed_text)
+
+        response_lines = []
+        analysis_result = {}
+        if vital_signs:
+            # Analyse des signes vitaux
+            analysis_result = self.vital_signs_analyzer.analyze(vital_signs)
+            response_lines.append("Analyse des signes vitaux :")
+            for rec in analysis_result["recommendations"]:
+                response_lines.append(f" - {rec}")
+            # Enregistrer le dossier patient si patient_id disponible
+            if patient_id:
+                record = {"timestamp": time.time(), "vital_signs": vital_signs, "analysis": analysis_result}
+                self.patient_record_manager.add_record(patient_id, record)
+                response_lines.append(f"Dossier patient {patient_id} mis à jour.")
+        else:
+            response_lines.append("Aucun signe vital détecté dans le message.")
+
+        # Exemple simple de rappel médicamenteux : recherche du mot "med:" suivi du nom et délai (ex: "med:aspirin, delay:10")
+        med_match = re.search(r"med:\s*(\w+).*delay:\s*(\d+)", processed_text)
+        if med_match:
+            medication = med_match.group(1)
+            delay = int(med_match.group(2))
+            # Lancer la planification du rappel (en tâche asynchrone)
+            asyncio.create_task(self.medication_reminder_manager.schedule_reminder(
+                patient_id if patient_id else "unknown", medication, delay
+            ))
+            response_lines.append(f"Rappel pour {medication} programmé dans {delay} secondes.")
+
+        # Chiffrer le message pour stockage sécurisé (démonstratif)
+        encrypted_message = self.encryption_manager.encrypt_data(message)
+        self.activity_tracker.record_activity(nurse_id, "message_chiffré", {"encrypted": encrypted_message})
+
+        # Construction de la réponse
+        response_text = (
+            f"Bonjour {nurse_id}, votre session ID : {session_id}\n" +
+            "\n".join(response_lines)
+        )
+        logger.info("Réponse construite pour NurseAssistant.")
+        return {
+            "response": response_text,
+            "session_id": session_id,
+            "analysis": analysis_result,
+            "encrypted_message": encrypted_message
+        }
+
+# =============================================================================
+# FASTAPI – Interface Web du NurseAssistant
+# =============================================================================
+app = FastAPI(title="NurseAssistant v1.0", description="Assistant virtuel pour infirmier/infirmières")
+
+class NurseChatRequest(BaseModel):
+    nurse_id: str
+    message: str
+    session_id: Optional[str] = None
+
+@app.post("/nurse_chat")
+async def nurse_chat(request: NurseChatRequest):
+    try:
+        assistant = NurseAssistant()
+        result = await assistant.handle_message(request.nurse_id, request.message, request.session_id)
+        return result
+    except Exception as e:
+        logger.error(f"Erreur dans le endpoint /nurse_chat: {e}")
+        return {"error": str(e)}
+
+# =============================================================================
+# WEBSOCKET – Pour les notifications en temps réel
+# =============================================================================
+active_ws_connections: List[WebSocket] = []
+
+@app.websocket("/ws/nurse")
+async def websocket_nurse(websocket: WebSocket):
+    await websocket.accept()
+    active_ws_connections.append(websocket)
+    assistant = NurseAssistant()
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # On suppose que le message reçu est un JSON contenant nurse_id et message
+            try:
+                payload = json.loads(data)
+                nurse_id = payload.get("nurse_id", "infirmier_anonyme")
+                message = payload.get("message", "")
+            except Exception:
+                nurse_id = "infirmier_anonyme"
+                message = data
+            result = await assistant.handle_message(nurse_id, message)
+            await websocket.send_text(json.dumps(result))
+    except WebSocketDisconnect:
+        active_ws_connections.remove(websocket)
+        logger.info("Connexion WebSocket infirmière déconnectée.")
+
+# =============================================================================
+# MAIN – Lancement de l'API
+# =============================================================================
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -67,7 +67,7 @@ Toute aide est la bienvenue ! Fork, clone, teste et propose des améliorations �
 Let’s build better tools for caregivers.
 
 📜 Licence
-Projet sous licence MIT — libre d’utilisation, modification et diffusion.
+Projet sous licence 
 
 ✍️ Par Diamajax
 “Parce que chaque minute compte, et chaque geste de soin mérite d’être soutenu.” – Diamajax
